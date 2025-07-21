@@ -1,0 +1,440 @@
+#include <Ticker.h>
+
+// Motor
+const int pwmL = D1;
+const int pwmR = D2;
+const int rotL = D3;
+const int rotR = D4;
+
+// Sensor garis
+const int s1 = D6;
+const int s2 = D7;
+const int s3 = A0;
+const int s4 = D8; 
+const int s5 = 10;
+
+// Servo dengan PWM manual
+
+#define SERVO1_PIN D0
+#define SERVO2_PIN D5
+
+Ticker servo1Ticker;
+Ticker servo2Ticker;
+
+volatile int angle1 = 0;
+volatile int angle2 = 0;
+
+void sendServo1PWM() {
+  int pulseWidth = map(angle1, 0, 180, 544, 2400);
+  digitalWrite(SERVO1_PIN, HIGH);
+  delayMicroseconds(pulseWidth);
+  digitalWrite(SERVO1_PIN, LOW);
+}
+void sendServo2PWM() {
+  int pulseWidth = map(angle2, 0, 180, 544, 2400);
+  digitalWrite(SERVO2_PIN, HIGH);
+  delayMicroseconds(pulseWidth);
+  digitalWrite(SERVO2_PIN, LOW);
+}
+
+// Function prototypes
+void berhenti();
+void maju();
+void majuPelan();
+void belokkiri();
+void belokkanan();
+void belokkiriKeras();
+void belokkananKeras();
+void mundur();
+void cariGaris();
+void belokkanan90();
+void belokkiri90();
+void followLine(int S1, int S2, int S3, int S4, int S5);
+void executeCase(int caseNumber);
+
+// Counter Case
+int counterCase = 0;
+
+// Flag untuk startup
+bool robotStarted = false;
+bool sudahMasukCase3 = false;
+
+// State variable for case transitions
+int state = 0;
+
+// Kecepatan motor - disesuaikan untuk respons yang lebih baik
+const int NormalKanan = 80;
+const int NormalKiri = 80;
+const int KananPelan = 40;
+const int KiriPelan = 40;
+const int kecepatanBelok = 75;
+const int kecepatanBeloklambat = 40;
+
+// Variabel untuk menghindari pembacaan ganda pada case detection
+unsigned long lastCaseTime = 0;
+const unsigned long caseDebounceDelay = 2000; // 2 detik debounce
+
+// Threshold untuk sensor analog
+const int analogThreshold = 500;
+
+// Variabel untuk PID-like control (opsional)
+int lastError = 0;
+int integral = 0;
+
+// Global sensor variables
+int S1, S2, S3, S4, S5;
+
+void setup() {
+  Serial.begin(115200); // Baudrate lebih tinggi untuk komunikasi serial yang lebih cepat
+
+  // Setup motor
+  pinMode(pwmL, OUTPUT);
+  pinMode(pwmR, OUTPUT);
+  pinMode(rotL, OUTPUT);
+  pinMode(rotR, OUTPUT);
+
+  // Setup sensor garis
+  pinMode(s1, INPUT);
+  pinMode(s2, INPUT);
+  pinMode(s4, INPUT);
+  pinMode(s5, INPUT);
+
+  pinMode(SERVO1_PIN, OUTPUT);
+  pinMode(SERVO2_PIN, OUTPUT);
+
+  servo1Ticker.attach_ms(20, sendServo1PWM);
+  servo2Ticker.attach_ms(20, sendServo2PWM);
+
+  angle1 = 40;
+  angle2 = 90;
+  
+  // Motor mati di awal
+  berhenti();
+  
+  Serial.println("Robot siap, menunggu semua sensor HIGH untuk start...");
+}
+
+void loop() {
+  // Baca semua sensor sekaligus untuk konsistensi
+  S1 = digitalRead(s1);
+  S2 = digitalRead(s2);
+  S3 = analogRead(s3) > analogThreshold ? 1 : 0;
+  S4 = digitalRead(s4);
+  S5 = digitalRead(s5);
+
+  // FUNGSI STARTUP - Menunggu semua sensor HIGH untuk mulai
+  if (!robotStarted) {
+    if (S1 == 1 && S2 == 1 && S3 == 1 && S4 == 1 && S5 == 1) {
+      Serial.println("Semua sensor HIGH - Robot akan start dalam 1 detik...");
+      berhenti();
+      delay(500);
+      robotStarted = true;
+      lastCaseTime = millis(); // Reset timer
+      Serial.println("Robot mulai mengikuti garis!");
+    } else {
+      berhenti();
+      // Hapus delay dan print statement yang tidak perlu
+      return;
+    }
+  }
+  // Deteksi 5 sensor HIGH (masuk case) dengan debounce
+  if (robotStarted && S2 && S3 && S4 && S5 && !S1) {
+  if (counterCase == 3) {
+
+    // Deteksi akhir case 3 (tetap jalan seperti biasa)
+    unsigned long currentTime = millis();
+    if (currentTime - lastCaseTime > caseDebounceDelay) {
+      counterCase++;
+      lastCaseTime = currentTime;
+      Serial.print("Masuk Case ke-");
+      Serial.println(counterCase);
+      executeCase(counterCase);
+    }
+  } 
+  else if (counterCase == 4 && sudahMasukCase3) {
+    // Case 4: S1 = 0, S2–S5 = 1, dan hanya setelah case 3
+    unsigned long currentTime = millis();
+    if (currentTime - lastCaseTime > caseDebounceDelay) {
+      lastCaseTime = currentTime;
+      Serial.println("Masuk Case ke-4 (Kondisi khusus S1=0)");
+      executeCase(4);
+    }
+  }
+} 
+
+else if (robotStarted && S1 && S2 && S3 && S4 && S5) {
+  // Deteksi umum semua sensor aktif, untuk case lainnya
+  unsigned long currentTime = millis();
+  if (currentTime - lastCaseTime > caseDebounceDelay) {
+    counterCase++;
+    lastCaseTime = currentTime;
+    Serial.print("Masuk Case ke-");
+    Serial.println(counterCase);
+    executeCase(counterCase);
+  }
+}
+
+  else if (robotStarted) {
+    // Logika line follower yang dioptimasi
+    followLine(S1, S2, S3, S4, S5);
+  }
+
+  // Debug nilai sensor (dikurangi frekuensinya)
+  static unsigned long lastDebugTime = 0;
+  if (robotStarted && millis() - lastDebugTime > 100) { // Debug setiap 100ms
+    Serial.print("S1: "); Serial.print(S1);
+    Serial.print(" | S2: "); Serial.print(S2);
+    Serial.print(" | S3: "); Serial.print(S3);
+    Serial.print(" | S4: "); Serial.print(S4);
+    Serial.print(" | S5: "); Serial.println(S5);
+    lastDebugTime = millis();
+  }
+}
+
+void followLine(int S1, int S2, int S3, int S4, int S5) {
+  // Sistem prioritas untuk pembacaan sensor yang lebih akurat
+  
+  if (S3 || (S2 && S3 && S4)){
+    maju();
+    return;
+
+  } if ((S3 && S4 && S5)|| (S4 && S5) || (S2 && S3 && S4 && S5)) {
+      if (S5) {
+        belokkananKeras();
+    }   else {
+        belokkanan();
+    } return;
+
+  } if ((S1 && S2 && S3) || (S1 && S2)  || (S1 && S2 && S3 && S4) ) {
+      if (S1) {
+      belokkiriKeras();
+    } else {
+      belokkiri();
+    } return;
+
+  } mundur();
+}
+
+void executeCase(int caseNumber) {
+  switch(caseNumber) {
+    case 1:
+      Serial.println("Case 1: Start Awalan Maju");
+      berhenti();
+      delay(200); 
+      maju(); 
+      break;
+      
+    case 2:
+      Serial.println("Case 2: Belok kanan 90 derajat");
+      digitalWrite(rotL, 0);
+      digitalWrite(rotR, 1);
+      analogWrite(pwmL, 90);
+      analogWrite(pwmR, 90);
+      delay(500);
+      digitalWrite(rotL, 1);
+      digitalWrite(rotR, 1);
+      analogWrite(pwmL, 90);
+      analogWrite(pwmR, 90);
+      delay(300);
+      break;
+      
+    case 3:
+      Serial.println("Case 3: Aksi kompleks");
+      berhenti();
+      delay(1000);
+      majuPelan();
+      delay(1550);
+      berhenti();
+      delay(1000);
+      angle2 = 2;
+      delay(500);
+      mundur();
+      delay(500);
+      belokkiri90();
+      delay(450); 
+      maju();
+      delay(300);
+      sudahMasukCase3 = true; // aktifkan flag
+      break;
+
+    case 4:
+      belokkanan90();
+      delay(770);
+      maju();
+      delay(300); 
+      break;
+    
+    case 5: 
+      Serial.println("Case 4: Aksi kompleks 2");
+      berhenti();
+      delay(500);
+      mundur();
+      delay(400);
+      berhenti();
+      delay(500);
+      angle2 = 80;
+      delay(500);
+      mundur();
+      delay(900);
+      belokkiri90();
+      delay(500);
+      maju();
+      delay(200);
+      break;
+
+    case 6:
+      Serial.println("Case 5: Bundaran Bulat, Belok Kanan"); 
+      belokkanan90();
+      delay(400);
+      break;
+
+    case 7:
+      Serial.println("Case 6: Bundaran Bulat, Belok Kanan"); 
+      belokkanan90();
+      delay(400);
+      angle1 = 120;
+      delay(200);
+      break;
+
+    case 8:
+      Serial.println("Case 8: Ambil Kelereng 1");
+      berhenti(); 
+      delay(1000);
+      digitalWrite(rotL, 0); 
+      digitalWrite(rotR, 0);
+      analogWrite(pwmL, 80); 
+      analogWrite(pwmR, 80); 
+      delay(500);
+      berhenti(); 
+      delay(1000);
+      angle1 = 25; 
+      delay(500);
+      digitalWrite(rotL, 1); 
+      digitalWrite(rotR, 1);
+      analogWrite(pwmL, 60); 
+      analogWrite(pwmR, 60); 
+      delay(250);
+      berhenti(); 
+      delay(500);
+      angle2 = 2; 
+      delay(500);
+      digitalWrite(rotL, 0); 
+      digitalWrite(rotR, 0);
+      analogWrite(pwmL, 80); 
+      analogWrite(pwmR, 80); 
+      delay(50);
+      angle1 = 180; 
+      delay(500);
+      belokkiri90(); 
+      delay(570);
+      digitalWrite(rotL, 1); 
+      digitalWrite(rotR, 1);
+      analogWrite(pwmL, 90); 
+      analogWrite(pwmR, 90); 
+      delay(500);
+      break;
+
+    case 9:
+      Serial.println("Case 9: Deteksi 4 sensor");
+      berhenti(); 
+      delay(1000);
+      digitalWrite(rotL, 0); 
+      digitalWrite(rotR, 0);
+      analogWrite(pwmL, 80); 
+      analogWrite(pwmR, 80); 
+      delay(500);
+      berhenti(); 
+      delay(1000);
+      angle1 = 110; 
+      delay(500);
+      digitalWrite(rotL, 1); 
+      digitalWrite(rotR, 1);
+      analogWrite(pwmL, 60); 
+      analogWrite(pwmR, 60); 
+      delay(250);
+      berhenti(); 
+      delay(1000);
+      angle2 = 80; 
+      delay(500);       
+      digitalWrite(rotL, 0); 
+      digitalWrite(rotR, 0);
+      analogWrite(pwmL, 80); 
+      analogWrite(pwmR, 80); 
+      delay(200);
+      digitalWrite(rotL, 1); 
+      digitalWrite(rotR, 0);
+      analogWrite(pwmL, 90); 
+      analogWrite(pwmR, 90); 
+      delay(250);       
+      digitalWrite(rotL, 1); 
+      digitalWrite(rotR, 1);
+      analogWrite(pwmL, 60); 
+      analogWrite(pwmR, 60); 
+      delay(250); 
+      break;
+  }
+  
+  Serial.println("Kembali mengikuti garis");
+  delay(30); // Delay minimal untuk stabilitas
+}
+
+void maju() {
+  digitalWrite(rotL, HIGH);
+  digitalWrite(rotR, HIGH);
+  analogWrite(pwmL, NormalKiri);
+  analogWrite(pwmR, NormalKanan);
+}
+void majuPelan() {
+  digitalWrite(rotL, HIGH);
+  digitalWrite(rotR, HIGH);
+  analogWrite(pwmL, KiriPelan);
+  analogWrite(pwmR, KananPelan);
+}
+void belokkiri() {
+  digitalWrite(rotL, HIGH);
+  digitalWrite(rotR, HIGH);
+  analogWrite(pwmL, kecepatanBelok);
+  analogWrite(pwmR, kecepatanBeloklambat);
+}
+void belokkanan() {
+  digitalWrite(rotL, HIGH);
+  digitalWrite(rotR, HIGH);
+  analogWrite(pwmL, kecepatanBeloklambat);
+  analogWrite(pwmR, kecepatanBelok);
+}
+void belokkiriKeras() {
+  digitalWrite(rotL, LOW);   // Motor kiri mundur
+  digitalWrite(rotR, HIGH);  // Motor kanan maju
+  analogWrite(pwmL, kecepatanBelok);
+  analogWrite(pwmR, kecepatanBelok);
+}
+void belokkananKeras() {
+  digitalWrite(rotL, HIGH);  // Motor kiri maju
+  digitalWrite(rotR, LOW);   // Motor kanan mundur
+  analogWrite(pwmL, kecepatanBelok);
+  analogWrite(pwmR, kecepatanBelok);
+}
+void mundur() {
+  digitalWrite(rotL, LOW);
+  digitalWrite(rotR, LOW);
+  analogWrite(pwmL, NormalKiri);
+  analogWrite(pwmR, NormalKanan);
+}
+void berhenti() {
+  digitalWrite(rotL, LOW);
+  digitalWrite(rotR, LOW);
+  analogWrite(pwmL, 0);
+  analogWrite(pwmR, 0);
+}
+void belokkanan90() {
+  digitalWrite(rotL, HIGH);
+  digitalWrite(rotR, LOW);
+  analogWrite(pwmL, 90);
+  analogWrite(pwmR, 90);
+}
+void belokkiri90() {
+  digitalWrite(rotL, LOW);
+  digitalWrite(rotR, HIGH);
+  analogWrite(pwmL, 90);
+  analogWrite(pwmR, 90);
+}
